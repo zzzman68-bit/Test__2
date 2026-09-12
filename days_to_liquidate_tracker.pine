@@ -71,3 +71,36 @@ if barstate.islast
     color statusColor = isHighRiskSpread ? color.red : (isVolumeThin ? color.orange : color.green)
     table.cell(infoTable, 0, 4, "Liquidity Risk:", text_color=color.white, text_size=size.small)
     table.cell(infoTable, 1, 4, riskStatus, text_color=statusColor, text_size=size.small)
+
+
+
+...............................................
+Here's what each input does:
+
+Your Position Size (Shares/Tokens) — set to 5,000,000. This is the total size of your holding you're trying to exit. 
+It's the numerator in the days-to-liquidate math: bigger position = more days needed to unwind at any given sell rate.
+
+Base Daily Participation Rate (%) — set to 10%. This is your starting assumption for "what % of a day's average volume am I comfortable selling into, without moving the market or blowing out the spread." 
+I.e The 10% setting means: "I'm willing to sell up to 10% of an average day's trading volume, each day, until my whole position is sold."
+10% is a common conservative default in execution/trading-desk practice. This is the rate before the volatility haircut is applied.
+
+
+Minimum Participation Rate Floor (%) — set to 0.5%. Even if volatility spikes hard and the script tries to scale your participation rate way down, it won't go below this floor. 
+Without it, a violent vol spike could make adjustedParticipation near-zero and daysToLiquidate explode to an unreadable number (like "14,382 Days"). This keeps the output interpretable.
+
+
+ADTV Benchmark Period — set to 20 (bars/days). This is the lookback window for the moving average of volume (Average Daily Traded Volume) 
+— it's also reused as the smoothing period for the "normal volatility" benchmark. 20 is roughly one trading month, a standard convention.
+
+
+ATR Volatility Period — set to 14. This is the lookback for the Average True Range calculation, which measures how much the price is moving per bar in absolute terms. 14 is the classic Wilder default.
+ATR is converted to a percentage of price (volatilityPct) so it can be compared across different-priced assets.
+
+Liquidity Alert: Volume Drop Threshold (%) — set to 30%. If today's volume falls more than 30% below the ADTV, the script flags isVolumeThin = true and triggers the amber "⚠️ THIN LIQUIDITY" warning — meaning fewer buyers/sellers are around than usual,
+so your assumed sell rate may not actually be achievable.
+
+24/7 Market (Crypto)? — unchecked (this is the toggle added in the last fix). It doesn't change any calculation — it only changes the dashboard label between "Days to Exit" (implying calendar days, appropriate for crypto which trades every day) and "Trading Days to Exit" 
+(appropriate for stocks, where weekends/holidays aren't counted in ADTV). Leave it unchecked for equities, check it for crypto/FX.
+
+With your current settings (5M position, 10% base rate, 20-day ADTV), if a name trades ~500K shares/day average, 
+your unadjusted days-to-liquidate would be 5,000,000 / (500,000 × 0.10) = 100 days — and the script will shrink that participation rate further (down to the 0.5% floor at worst) whenever volatility runs hot, stretching that number out even more.
