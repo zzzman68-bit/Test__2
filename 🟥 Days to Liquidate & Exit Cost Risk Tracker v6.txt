@@ -1,0 +1,155 @@
+//@version=5
+indicator("🟥 Days to Liquidate & Exit Cost Risk Tracker v6", overlay=false)
+
+// =====================================================================
+// 1. USER & RISK INPUTS
+// =====================================================================
+myPositionSize     = input.int(100000, title="Your Position Size (Shares/Tokens)", group="Position")
+baseParticipation  = input.float(10.0, title="Base Daily Participation Rate (%)", minval=0.1, maxval=100.0, group="Position")
+minParticipation   = input.float(0.5, title="Minimum Participation Rate Floor (%)", minval=0.01, maxval=100.0, group="Position")
+maxParticipation   = input.float(25.0, title="Maximum Participation Ceiling (%)", minval=1.0, maxval=100.0, tooltip="Hard cap on participation. Selling more than ~25% of ADTV in a day starts to BECOME the liquidity problem itself — the model should not assume you can.", group="Position")
+
+adtvLength         = input.int(20, title="ADTV Benchmark Period (days)", group="Liquidity")
+useMedianADTV      = input.bool(true, title="Use Median ADTV (robust to block-trade skew)? — off = simple average", group="Liquidity")
+minDollarADTV      = input.float(2000000, title="Absolute Illiquidity Floor ($ ADTV)", tooltip="If dollar ADTV falls below this, the name is flagged illiquid regardless of your position size ratio.", group="Liquidity")
+tapeCoverageFactor = input.float(1.0, title="Tape Coverage Factor", minval=0.2, maxval=5.0, step=0.1, tooltip="Multiplier approximating total liquidity vs. on-chart tape volume. For liquid US equities (large off-exchange volume) 1.5-2.0 avoids overstating impact. Leave 1.0 for crypto / small-caps.", group="Liquidity")
+useDailyAgg        = input.bool(true, title="Aggregate volume to daily (works on any timeframe)", tooltip="On intraday charts, fetches daily-bar volume via request.security so ADTV is always a true daily figure. On realtime bars the current forming day updates live — expected behavior for a live tracker.", group="Liquidity")
+
+atrLength          = input.int(14, title="ATR Volatility Period", group="Volatility")
+volDropThreshold   = input.float(30.0, title="Liquidity Alert: Volume Drop Threshold (%)", minval=1.0, maxval=99.0, group="Volatility")
+volBlowoutMult     = input.float(1.5, title="Spread Blowout: Vol vs Normal Multiple", minval=1.05, maxval=5.0, step=0.05, group="Volatility")
+
+spreadLookback     = input.int(20, title="Spread Proxy Lookback (days)", group="Exit Cost")
+spreadOfRangePct   = input.float(20.0, title="Assumed Spread as % of Daily Range", tooltip="Pine has no real bid/ask feed. This estimates the round-trip spread as a fraction of the average (high-low)/close range — a proxy, not a live quote. Calibrate against real Level-1/Level-2 data for the name if available.", minval=1.0, maxval=100.0, group="Exit Cost")
+impactCoefficient  = input.float(0.5, title="Market Impact Coefficient (η)", tooltip="Almgren-Chriss style square-root impact model: Impact% = η × sqrt(Position / ADTV). 0.5 is a common starting calibration for equities; recalibrate per-name if you have historical execution data.", group="Exit Cost")
+
+is24_7Market       = input.bool(false, title="24/7 Market (Crypto)? — affects 'Days' label only", group="Display")
+
+// =====================================================================
+// 2. VOLUME SERIES & TIMEFRAME GUARD
+// =====================================================================
+closePrice = close
+
+rawVolume = useDailyAgg ? request.security(syminfo.tickerid, "D", volume, lookahead=barmerge.lookahead_off) : volume
+tfOK      = useDailyAgg or timeframe.isdaily
+
+// =====================================================================
+// 3. ADTV & VOLATILITY
+// =====================================================================
+adtvSMA    = ta.sma(rawVolume, adtvLength)
+adtvMedian = ta.percentile_nearest_rank(rawVolume, adtvLength, 50)
+adtv       = useMedianADTV ? adtvMedian : adtvSMA
+effectiveADTV = adtv * tapeCoverageFactor   // total-liquidity approximation
+dollarADTV    = effectiveADTV * closePrice
+
+atr           = ta.atr(atrLength)
+volatilityPct = closePrice > 0 ? (atr / closePrice) * 100.0 : na
+normalVolPct  = ta.sma(volatilityPct, adtvLength)
+
+// =====================================================================
+// 4. DYNAMIC PARTICIPATION (floor + ceiling)
+// =====================================================================
+volatilityScaleFactor = (not na(volatilityPct)) and (not na(normalVolPct)) and volatilityPct > normalVolPct and volatilityPct > 0
+     ? (normalVolPct / volatilityPct)
+     : 1.0
+
+adjustedParticipation = math.min(math.max(baseParticipation * volatilityScaleFactor, minParticipation), maxParticipation)
+
+// =====================================================================
+// 5. LIQUIDATION TIME
+// =====================================================================
+pctRate         = adjustedParticipation / 100.0
+maxDailySell    = effectiveADTV * pctRate
+daysToLiquidate = (not na(maxDailySell)) and maxDailySell > 0 ? myPositionSize / maxDailySell : na
+
+// =====================================================================
+// 6. EXIT COST ESTIMATE — spread proxy + market impact
+// =====================================================================
+positionValue = myPositionSize * closePrice
+
+avgRangePct   = ta.sma((high - low) / closePrice, spreadLookback) * 100.0
+estSpreadPct  = avgRangePct * (spreadOfRangePct / 100.0)
+estSpreadCost = positionValue * (estSpreadPct / 100.0)
+
+impactRatio   = (not na(effectiveADTV)) and effectiveADTV > 0 ? myPositionSize / effectiveADTV : na
+estImpactPct  = (not na(impactRatio)) and impactRatio >= 0 ? math.min(impactCoefficient * math.sqrt(impactRatio) * 100.0, 100.0) : na
+estImpactCost = (not na(estImpactPct)) ? positionValue * (estImpactPct / 100.0) : na
+
+estTotalExitCostPct = (not na(estImpactPct)) ? estSpreadPct + estImpactPct : na
+estTotalExitCost    = (not na(estImpactCost)) ? estSpreadCost + estImpactCost : na
+
+// =====================================================================
+// 7. LIQUIDITY RISK FLAGS & STATE MACHINE
+// =====================================================================
+isVolumeThin         = (not na(adtv)) and rawVolume < (adtv * (1.0 - (volDropThreshold / 100.0)))
+isHighRiskSpread     = (not na(volatilityPct)) and (not na(normalVolPct)) and volatilityPct > (normalVolPct * volBlowoutMult)
+isBelowAbsoluteFloor = (not na(dollarADTV)) and dollarADTV < minDollarADTV
+
+riskState    = isBelowAbsoluteFloor ? 3 : isHighRiskSpread ? 2 : isVolumeThin ? 1 : 0
+stateChanged = riskState != riskState[1]
+
+// =====================================================================
+// 8. VISUAL RENDERING
+// =====================================================================
+plotColor = na(daysToLiquidate) ? color.gray : daysToLiquidate <= 3 ? color.green : daysToLiquidate <= 10 ? color.orange : color.red
+plot(daysToLiquidate, title="Days to Liquidate", color=plotColor, linewidth=2)
+hline(1.0, "1 Day Horizon", color=color.gray, linestyle=hline.style_dashed)
+
+bgcolor(
+     not tfOK ? color.new(color.red, 88) :
+     isBelowAbsoluteFloor ? color.new(color.purple, 75) :
+     isHighRiskSpread ? color.new(color.red, 80) :
+     isVolumeThin ? color.new(color.orange, 85) : na,
+     title="Risk Level Background")
+
+// =====================================================================
+// 9. DASHBOARD
+// =====================================================================
+var table coreTable = table.new(position = position.top_right, columns = 2, rows = 7, bgcolor = color.new(color.black, 15), border_width = 1)
+var table costTable = table.new(position = position.bottom_right, columns = 2, rows = 4, bgcolor = color.new(color.black, 15), border_width = 1)
+
+if barstate.islast
+    string adtvLabel = "ADTV (" + str.tostring(adtvLength) + "d, " + (useMedianADTV ? "median" : "avg") + (tapeCoverageFactor != 1.0 ? ", ×" + str.tostring(tapeCoverageFactor, "#.#") : "") + "):"
+    table.cell(coreTable, 0, 0, adtvLabel, text_color=color.white, text_size=size.small)
+    table.cell(coreTable, 1, 0, na(effectiveADTV) ? "N/A" : str.tostring(math.round(effectiveADTV)), text_color=color.yellow, text_size=size.small)
+
+    table.cell(coreTable, 0, 1, "$ ADTV:", text_color=color.white, text_size=size.small)
+    table.cell(coreTable, 1, 1, na(dollarADTV) ? "N/A" : "$" + str.tostring(math.round(dollarADTV)), text_color=isBelowAbsoluteFloor ? color.fuchsia : color.yellow, text_size=size.small)
+
+    table.cell(coreTable, 0, 2, "Adj. Exit Rate:", text_color=color.white, text_size=size.small)
+    table.cell(coreTable, 1, 2, str.tostring(adjustedParticipation, "#.##") + "%", text_color=color.aqua, text_size=size.small)
+
+    table.cell(coreTable, 0, 3, "Daily Sell Amount:", text_color=color.white, text_size=size.small)
+    table.cell(coreTable, 1, 3, na(maxDailySell) ? "N/A" : str.tostring(math.round(maxDailySell)), text_color=color.lime, text_size=size.small)
+
+    string daysLabel = is24_7Market ? "Days to Exit:" : "Trading Days to Exit:"
+    table.cell(coreTable, 0, 4, daysLabel, text_color=color.white, text_size=size.small)
+    table.cell(coreTable, 1, 4, na(daysToLiquidate) ? "N/A" : str.tostring(daysToLiquidate, "#.##") + " Days", text_color=plotColor, text_size=size.small)
+
+    string ratioFlag = isBelowAbsoluteFloor ? "🟣 BELOW ABS. FLOOR" : (isHighRiskSpread ? "💥 SPREAD BLOWOUT" : (isVolumeThin ? "⚠️ THIN LIQUIDITY" : "✅ NORMAL"))
+    color ratioColor = isBelowAbsoluteFloor ? color.purple : (isHighRiskSpread ? color.red : (isVolumeThin ? color.orange : color.green))
+    table.cell(coreTable, 0, 5, "Liquidity Risk:", text_color=color.white, text_size=size.small)
+    table.cell(coreTable, 1, 5, ratioFlag, text_color=ratioColor, text_size=size.small)
+
+    table.cell(coreTable, 0, 6, "Timeframe:", text_color=color.white, text_size=size.small)
+    table.cell(coreTable, 1, 6, tfOK ? "✅ OK" : "⚠️ NOT DAILY", text_color=tfOK ? color.green : color.red, text_size=size.small)
+
+    table.cell(costTable, 0, 0, "Est. Spread Cost:", text_color=color.white, text_size=size.small)
+    table.cell(costTable, 1, 0, na(estSpreadCost) ? "N/A" : "$" + str.tostring(math.round(estSpreadCost)) + " (" + str.tostring(estSpreadPct, "#.##") + "%)", text_color=color.silver, text_size=size.small)
+
+    table.cell(costTable, 0, 1, "Est. Market Impact:", text_color=color.white, text_size=size.small)
+    table.cell(costTable, 1, 1, na(estImpactCost) ? "N/A" : "$" + str.tostring(math.round(estImpactCost)) + " (" + str.tostring(estImpactPct, "#.##") + "%)", text_color=color.silver, text_size=size.small)
+
+    table.cell(costTable, 0, 2, "Est. Total Exit Cost:", text_color=color.white, text_size=size.small)
+    table.cell(costTable, 1, 2, na(estTotalExitCost) ? "N/A" : "$" + str.tostring(math.round(estTotalExitCost)) + " (" + str.tostring(estTotalExitCostPct, "#.##") + "%)", text_color=color.orange, text_size=size.small)
+
+    table.cell(costTable, 0, 3, "Note:", text_color=color.gray, text_size=size.tiny)
+    table.cell(costTable, 1, 3, "Proxies only — impact capped at 100%", text_color=color.gray, text_size=size.tiny)
+
+// =====================================================================
+// 10. ALERTS (fire once per state change, not every bar)
+// =====================================================================
+alertcondition(stateChanged and riskState == 3, title="Below Absolute Liquidity Floor", message="Dollar ADTV has fallen below your configured illiquidity floor.")
+alertcondition(stateChanged and riskState == 2, title="Spread Blowout Risk", message="Volatility is running significantly above normal — spreads likely widening.")
+alertcondition(stateChanged and riskState == 1, title="Thin Liquidity Warning", message="Today's volume is well below the ADTV benchmark.")
+alertcondition(stateChanged and riskState == 0, title="Liquidity Back to Normal", message="All liquidity risk flags have cleared.")

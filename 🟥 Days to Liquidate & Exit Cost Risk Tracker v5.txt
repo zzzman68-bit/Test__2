@@ -1,0 +1,159 @@
+//@version=5
+indicator("🟥 Days to Liquidate & Exit Cost Risk Tracker v5", overlay=false)
+
+// =====================================================================
+// 1. USER & RISK INPUTS
+// =====================================================================
+myPositionSize     = input.int(100000, title="Your Position Size (Shares/Tokens)", group="Position")
+baseParticipation  = input.float(10.0, title="Base Daily Participation Rate (%)", minval=0.1, maxval=100.0, group="Position")
+minParticipation   = input.float(0.5, title="Minimum Participation Rate Floor (%)", minval=0.01, maxval=100.0, group="Position")
+
+adtvLength         = input.int(20, title="ADTV Benchmark Period (days)", group="Liquidity")
+useMedianADTV      = input.bool(true, title="Use Median ADTV (robust to block-trade skew)? — off = simple average", group="Liquidity")
+minDollarADTV      = input.float(2000000, title="Absolute Illiquidity Floor ($ ADTV)", tooltip="If dollar ADTV falls below this, the name is flagged illiquid regardless of your position size ratio.", group="Liquidity")
+
+atrLength          = input.int(14, title="ATR Volatility Period", group="Volatility")
+volDropThreshold   = input.float(30.0, title="Liquidity Alert: Volume Drop Threshold (%)", minval=1.0, maxval=99.0, group="Volatility")
+
+spreadLookback     = input.int(20, title="Spread Proxy Lookback (days)", group="Exit Cost")
+spreadOfRangePct   = input.float(20.0, title="Assumed Spread as % of Daily Range", tooltip="Pine has no real bid/ask feed. This estimates the round-trip spread as a fraction of the average (high-low)/close range — a proxy, not a live quote. Calibrate against real Level-1/Level-2 data for the name if available.", minval=1.0, maxval=100.0, group="Exit Cost")
+impactCoefficient  = input.float(0.5, title="Base Market Impact Coefficient (η)", tooltip="Almgren-Chriss style square-root impact model. 0.5 is a common starting calibration for equities. This will now dynamically scale up if volatility spikes.", group="Exit Cost")
+
+// NEW: Execution Cost Alert Threshold
+badExecutionThreshold = input.float(2.0, title="Alert if Total Exit Cost Exceeds (%)", tooltip="If estimated spread + market impact exceeds this percentage of position value, trigger an alert.", group="Exit Cost")
+
+is24_7Market       = input.bool(false, title="24/7 Market (Crypto)? — affects 'Days' label only", group="Display")
+// NEW: Smart Background Toggling
+bgOnlyDaily        = input.bool(true, title="Only show risk background on Daily+ charts?", tooltip="ADTV is a daily metric. Showing background alerts on intraday charts can be distracting.", group="Display")
+
+// =====================================================================
+// 2. MARKET DYNAMICS & VOLATILITY
+// =====================================================================
+closePrice = close
+
+// --- Robust ADTV: median-based option to resist single block-trade skew ---
+adtvSMA    = ta.sma(volume, adtvLength)
+adtvMedian = ta.percentile_nearest_rank(volume, adtvLength, 50)
+adtv       = useMedianADTV ? adtvMedian : adtvSMA
+dollarADTV = adtv * closePrice
+
+// --- Volatility (ATR-based) ---
+atr          = ta.atr(atrLength)
+volatilityPct = closePrice > 0 ? (atr / closePrice) * 100.0 : na
+normalVolPct  = ta.sma(volatilityPct, adtvLength)
+
+// =====================================================================
+// 3. DYNAMIC PARTICIPATION HAIRCUT
+// =====================================================================
+volatilityScaleFactor = (not na(volatilityPct)) and (not na(normalVolPct)) and volatilityPct > normalVolPct and volatilityPct > 0
+     ? (normalVolPct / volatilityPct)
+     : 1.0
+
+adjustedParticipationRaw = baseParticipation * volatilityScaleFactor
+adjustedParticipation    = math.max(adjustedParticipationRaw, minParticipation)
+
+// =====================================================================
+// 4. LIQUIDATION TIME
+// =====================================================================
+pctRate         = adjustedParticipation / 100.0
+maxDailySell    = adtv * pctRate
+daysToLiquidate = (not na(maxDailySell)) and maxDailySell > 0 ? myPositionSize / maxDailySell : na
+
+// =====================================================================
+// 5. EXIT COST ESTIMATE (UPGRADED) 
+// =====================================================================
+positionValue = myPositionSize * closePrice
+
+// Spread proxy
+avgRangePct   = ta.sma((high - low) / closePrice, spreadLookback) * 100.0
+estSpreadPct  = avgRangePct * (spreadOfRangePct / 100.0)
+estSpreadCost = positionValue * (estSpreadPct / 100.0)
+
+// DYNAMIC Market impact proxy: square-root law (Almgren-Chriss style).
+// NEW: Coefficient scales up dynamically if volatility is higher than normal.
+volRatio = (not na(volatilityPct) and not na(normalVolPct) and normalVolPct > 0) ? (volatilityPct / normalVolPct) : 1.0
+dynamicImpactCoeff = impactCoefficient * (volRatio > 1.0 ? volRatio : 1.0)
+
+impactRatio   = (not na(adtv)) and adtv > 0 ? myPositionSize / adtv : na
+estImpactPct  = (not na(impactRatio)) and impactRatio >= 0 ? dynamicImpactCoeff * math.sqrt(impactRatio) * 100.0 : na
+estImpactCost = (not na(estImpactPct)) ? positionValue * (estImpactPct / 100.0) : na
+
+estTotalExitCostPct = (not na(estImpactPct)) ? estSpreadPct + estImpactPct : na
+estTotalExitCost    = (not na(estImpactCost)) ? estSpreadCost + estImpactCost : na
+
+// =====================================================================
+// 6. LIQUIDITY RISK FLAGS
+// =====================================================================
+isVolumeThin      = (not na(adtv)) and volume < (adtv * (1.0 - (volDropThreshold / 100.0)))
+isHighRiskSpread  = (not na(volatilityPct)) and (not na(normalVolPct)) and volatilityPct > (normalVolPct * 1.5)
+isBelowAbsoluteFloor = (not na(dollarADTV)) and dollarADTV < minDollarADTV
+
+// NEW: Bad Execution Flag
+isBadExecution = (not na(estTotalExitCostPct)) and estTotalExitCostPct > badExecutionThreshold
+
+// =====================================================================
+// 7. VISUAL RENDERING
+// =====================================================================
+plot(daysToLiquidate, title="Days to Liquidate", color=color.orange, linewidth=2)
+hline(1.0, "1 Day Horizon", color=color.gray, linestyle=hline.style_dashed)
+
+// NEW: Conditional Background based on Timeframe
+showBg = bgOnlyDaily ? timeframe.isdaily : true
+bgcolor(
+     showBg and isBelowAbsoluteFloor ? color.new(color.purple, 75) :
+     showBg and isHighRiskSpread ? color.new(color.red, 80) :
+     showBg and isVolumeThin ? color.new(color.orange, 85) : na,
+     title="Risk Level Background")
+
+// =====================================================================
+// 8. VISUAL DASHBOARD
+// =====================================================================
+var table coreTable = table.new(position = position.top_right, columns = 2, rows = 6, bgcolor = color.new(color.black, 15), border_width = 1)
+var table costTable = table.new(position = position.bottom_right, columns = 2, rows = 4, bgcolor = color.new(color.black, 15), border_width = 1)
+
+if barstate.islast
+    // --- Core liquidity table ---
+    table.cell(coreTable, 0, 0, "ADTV (" + str.tostring(adtvLength) + "d, " + (useMedianADTV ? "median" : "avg") + "):", text_color=color.white, text_size=size.small)
+    table.cell(coreTable, 1, 0, na(adtv) ? "N/A" : str.tostring(math.round(adtv)), text_color=color.yellow, text_size=size.small)
+
+    table.cell(coreTable, 0, 1, "$ ADTV:", text_color=color.white, text_size=size.small)
+    table.cell(coreTable, 1, 1, na(dollarADTV) ? "N/A" : "$" + str.tostring(math.round(dollarADTV)), text_color=isBelowAbsoluteFloor ? color.fuchsia : color.yellow, text_size=size.small)
+
+    table.cell(coreTable, 0, 2, "Adj. Exit Rate:", text_color=color.white, text_size=size.small)
+    table.cell(coreTable, 1, 2, str.tostring(adjustedParticipation, "#.##") + "%", text_color=color.aqua, text_size=size.small)
+
+    table.cell(coreTable, 0, 3, "Daily Sell Amount:", text_color=color.white, text_size=size.small)
+    table.cell(coreTable, 1, 3, na(maxDailySell) ? "N/A" : str.tostring(math.round(maxDailySell)), text_color=color.lime, text_size=size.small)
+
+    string daysLabel = is24_7Market ? "Days to Exit:" : "Trading Days to Exit:"
+    table.cell(coreTable, 0, 4, daysLabel, text_color=color.white, text_size=size.small)
+    table.cell(coreTable, 1, 4, na(daysToLiquidate) ? "N/A" : str.tostring(daysToLiquidate, "#.##") + " Days", text_color=color.orange, text_size=size.small)
+
+    string ratioFlag = isBelowAbsoluteFloor ? "🟣 BELOW ABS. FLOOR" : (isHighRiskSpread ? "💥 SPREAD BLOWOUT" : (isVolumeThin ? "⚠️ THIN LIQUIDITY" : "✅ NORMAL"))
+    color ratioColor = isBelowAbsoluteFloor ? color.purple : (isHighRiskSpread ? color.red : (isVolumeThin ? color.orange : color.green))
+    table.cell(coreTable, 0, 5, "Liquidity Risk:", text_color=color.white, text_size=size.small)
+    table.cell(coreTable, 1, 5, ratioFlag, text_color=ratioColor, text_size=size.small)
+
+    // --- Exit cost table ---
+    table.cell(costTable, 0, 0, "Est. Spread Cost:", text_color=color.white, text_size=size.small)
+    table.cell(costTable, 1, 0, na(estSpreadCost) ? "N/A" : "$" + str.tostring(math.round(estSpreadCost)) + " (" + str.tostring(estSpreadPct, "#.##") + "%)", text_color=color.silver, text_size=size.small)
+
+    table.cell(costTable, 0, 1, "Est. Market Impact:", text_color=color.white, text_size=size.small)
+    table.cell(costTable, 1, 1, na(estImpactCost) ? "N/A" : "$" + str.tostring(math.round(estImpactCost)) + " (" + str.tostring(estImpactPct, "#.##") + "%)", text_color=color.silver, text_size=size.small)
+
+    // NEW: Total exit cost cell turns red if it exceeds the alert threshold
+    color exitCostColor = isBadExecution ? color.red : color.orange
+    table.cell(costTable, 0, 2, "Est. Total Exit Cost:", text_color=color.white, text_size=size.small)
+    table.cell(costTable, 1, 2, na(estTotalExitCost) ? "N/A" : "$" + str.tostring(math.round(estTotalExitCost)) + " (" + str.tostring(estTotalExitCostPct, "#.##") + "%)", text_color=exitCostColor, text_size=size.small)
+
+    table.cell(costTable, 0, 3, "Note:", text_color=color.gray, text_size=size.tiny)
+    table.cell(costTable, 1, 3, "Single-symbol only — no cross-broker view", text_color=color.gray, text_size=size.tiny)
+
+// =====================================================================
+// ALERTS
+// =====================================================================
+alertcondition(isBelowAbsoluteFloor, title="Below Absolute Liquidity Floor", message="Dollar ADTV has fallen below your configured illiquidity floor.")
+alertcondition(isHighRiskSpread, title="Spread Blowout Risk", message="Volatility is running significantly above normal — spreads likely widening.")
+alertcondition(isVolumeThin, title="Thin Liquidity Warning", message="Today's volume is well below the ADTV benchmark.")
+// NEW: High execution cost alert
+alertcondition(isBadExecution, title="High Execution Cost Alert", message="Estimated total exit cost (spread + impact) exceeds your threshold. Liquidation will be expensive.")
