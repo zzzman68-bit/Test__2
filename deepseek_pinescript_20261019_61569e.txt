@@ -1,0 +1,150 @@
+//@version=5
+indicator("LAHEI — Liquidity-Adjusted Horizon Efficiency Index", shorttitle="LAHEI", overlay=false)
+
+// ─────────────────────────────────────────────────────────────
+// INPUTS  (hover any input for usage help)
+// ─────────────────────────────────────────────────────────────
+
+grpA = "1) Horizon"
+T_in = input.float(5.0, "Evaluation horizon T (days)",
+     minval=0.01, step=0.5, group=grpA,
+     tooltip="Holding horizon in DAYS. Use 1/24≈0.042 for hourly, 1 for daily, 5 for weekly, 21 for monthly. LAHEI scales as ln(1+T/T0), so doubling T adds less than double the score. Match T to your actual rebalance interval.")
+
+T0_in = input.float(1.0, "Reference horizon T0 (days)",
+     minval=0.01, group=grpA,
+     tooltip="Normalization anchor for the log term. Keep at 1.0 (one day) unless you are comparing across markets with different natural trading cadences.")
+
+grpB = "2) Liquidity inputs"
+adrLen = input.int(5, "ADR% lookback (bars)",
+     minval=2, group=grpB,
+     tooltip="Bars used to average (high-low)/close. 5 ≈ one trading week on daily charts. Shorter = noisier, longer = slower to react to liquidity regime shifts.")
+
+adtvLen = input.int(20, "ADTV normalization lookback (bars)",
+     minval=5, group=grpB,
+     tooltip="Bars used to compute average volume for the denominator. 20 ≈ one trading month. This is the proxy for ADTV_norm. CRITICAL: Pine only has 'volume', not exchange ADTV — for equities use a 20-day SMA of dollar volume if your data feed supports it.")
+
+adtvMedian = input.float(1000000.0, "ADTV class median (shares or contracts)",
+     minval=1.0, group=grpB,
+     tooltip="The ADTV_norm denominator. Set this to the MEDIAN ADTV of the asset class you are trading (e.g. 1e6 for US mid-caps, 1e8 for mega-caps, 1e4 for small caps). This is what makes LAHEI cross-asset comparable — get it wrong and the score is meaningless.")
+
+grpC = "3) Volatility & cost"
+volLen = input.int(252, "Realized vol lookback (bars)",
+     minval=20, group=grpC,
+     tooltip="Bars for annualized realized volatility used as σ_class proxy. WARNING: this uses the symbol's OWN vol, not the class median — this creates endogeneity. For research, replace with an external class-vol series. For screening, 252 is acceptable.")
+
+crt_in = input.float(10.0, "Round-trip cost c_rt (bps)",
+     minval=0.1, step=0.5, group=grpC,
+     tooltip="Your estimated spread + commission + impact for a full round trip, in basis points. MUST be supplied manually — Pine has no execution feed. Typical: 2 bps mega-cap, 15 bps mid-cap, 40+ bps small-cap. Net LAHEI divides by (c_rt/c_0).")
+
+c0_in = input.float(10.0, "Reference cost c_0 (bps)",
+     minval=0.1, group=grpC,
+     tooltip="Anchor for the cost ratio. Keep at 10 bps. Only change if you want LAHEI expressed relative to a different cost regime.")
+
+grpD = "4) Display & alerts"
+showGross = input.bool(true, "Plot Gross LAHEI", group=grpD,
+     tooltip="Gross = Term A × horizon amplifier. This is 'where EMH is weakest' WITHOUT cost drag. Use it to diagnose raw inefficiency.")
+showNet = input.bool(true, "Plot Net LAHEI", group=grpD,
+     tooltip="Net = Gross ÷ cost ratio. This is the tradeable version. Rank stocks by Net LAHEI for pre-filtering; a high Gross with low Net means 'looks inefficient but cost eats it'.")
+alertThresh = input.float(5.0, "Net LAHEI alert threshold",
+     minval=0.0, group=grpD,
+     tooltip="Fire alert 'L' when Net LAHEI crosses above this value. Calibrate per asset class: mid-caps often sit 5–20, large-caps 1–5. Run a 60-day distribution first and set this to the ~80th percentile.")
+
+// ─────────────────────────────────────────────────────────────
+// CALCULATIONS
+// ─────────────────────────────────────────────────────────────
+
+// ADR% : mean of (high-low)/close over adrLen bars, expressed in %
+adrRaw = (high - low) / close * 100.0
+adrPct = ta.sma(adrRaw, adrLen)
+
+// ADTV_norm : average volume / class median
+adtvAvg = ta.sma(volume, adtvLen)
+adtvNorm = adtvAvg / adtvMedian
+
+// σ_class proxy : annualized realized vol from log returns
+logRet = math.log(close / close[1])
+realVol = ta.stdev(logRet, volLen) * math.sqrt(252.0)
+
+// Term A : illiquidity-per-volatility
+termA = (adrPct / math.sqrt(math.max(adtvNorm, 0.0001))) / math.max(realVol, 0.0001)
+
+// Term B : horizon amplifier
+termB = math.log(1.0 + T_in / T0_in)
+
+// Term C : cost drag
+termC = crt_in / c0_in
+
+// Gross and Net
+grossLAHEI = termA * termB
+netLAHEI   = grossLAHEI / math.max(termC, 0.0001)
+
+// ─────────────────────────────────────────────────────────────
+// PLOTS
+// ─────────────────────────────────────────────────────────────
+
+plot(showGross ? grossLAHEI : na, "Gross LAHEI",
+     color=color.new(color.orange, 0), linewidth=2)
+
+plot(showNet ? netLAHEI : na, "Net LAHEI",
+     color=color.new(color.teal, 0), linewidth=2)
+
+hline(alertThresh, "Alert threshold",
+     color=color.new(color.gray, 50), linestyle=hline.style_dashed)
+
+// ─────────────────────────────────────────────────────────────
+// LETTER ALERTS
+//   G = Gross LAHEI crossed above threshold (raw inefficiency rising)
+//   N = Net LAHEI crossed above threshold (tradeable inefficiency)
+//   X = Net LAHEI crossed below threshold (edge decaying / cost eating it)
+//   D = Gross-Net divergence (Gross high, Net low => cost trap)
+// ─────────────────────────────────────────────────────────────
+
+crossG = ta.crossover(grossLAHEI, alertThresh)
+crossN = ta.crossover(netLAHEI, alertThresh)
+crossX = ta.crossunder(netLAHEI, alertThresh)
+
+// Divergence: Gross above threshold but Net below — classic cost trap
+divergence = grossLAHEI > alertThresh and netLAHEI < alertThresh
+
+if crossG
+    alert("G: Gross LAHEI crossed above " + str.tostring(alertThresh, "#.##") + " on " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+if crossN
+    alert("N: Net LAHEI crossed above " + str.tostring(alertThresh, "#.##") + " on " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+if crossX
+    alert("X: Net LAHEI crossed below " + str.tostring(alertThresh, "#.##") + " on " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+if divergence
+    alert("D: Cost-trap divergence on " + syminfo.ticker + " — Gross=" + str.tostring(grossLAHEI, "#.##") + " Net=" + str.tostring(netLAHEI, "#.##"), alert.freq_once_per_bar_close)
+
+// ─────────────────────────────────────────────────────────────
+// INFO TABLE (hover the table cells for usage notes)
+// ─────────────────────────────────────────────────────────────
+
+var table info = table.new(position.top_right, 2, 6, border_width=1)
+
+if barstate.islast
+    table.cell(info, 0, 0, "Metric", bgcolor=color.new(color.gray, 80), text_color=color.white)
+    table.cell(info, 1, 0, "Value", bgcolor=color.new(color.gray, 80), text_color=color.white)
+
+    table.cell(info, 0, 1, "ADR%", tooltip="Average daily range as % of price over the lookback. Higher = more price room per bar.")
+    table.cell(info, 1, 1, str.tostring(adrPct, "#.##") + "%")
+
+    table.cell(info, 0, 2, "ADTV_norm", tooltip="Average volume ÷ class median. >1 = more liquid than class median; <1 = less. Drives the denominator of Term A.")
+    table.cell(info, 1, 2, str.tostring(adtvNorm, "#.##"))
+
+    table.cell(info, 0, 3, "σ (proxy)", tooltip="Annualized realized vol used as σ_class. WARNING: own-symbol vol, not class median — endogenous. Replace externally for research.")
+    table.cell(info, 1, 3, str.tostring(realVol * 100.0, "#.##") + "%")
+
+    table.cell(info, 0, 4, "Gross LAHEI", tooltip="Term A × ln(1+T/T0). 'Where EMH is weakest' ignoring cost. Use for diagnosing raw inefficiency across assets/horizons.")
+    table.cell(info, 1, 4, str.tostring(grossLAHEI, "#.##"), text_color=color.orange)
+
+    table.cell(info, 0, 5, "Net LAHEI", tooltip="Gross ÷ (c_rt/c_0). The tradeable version. Rank by this for pre-filtering. High Gross + low Net = cost trap (alert D).")
+    table.cell(info, 1, 5, str.tostring(netLAHEI, "#.##"), text_color=color.teal)
+
+// ─────────────────────────────────────────────────────────────
+// BAR COLOR (optional visual cue)
+// ─────────────────────────────────────────────────────────────
+
+barcolor(divergence ? color.new(color.red, 60) : na, title="Cost-trap divergence")

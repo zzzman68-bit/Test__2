@@ -1,0 +1,233 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © TANIQ - Timeframe-Adjusted Net Inefficiency Quotient
+
+//@version=5
+indicator("TANIQ - Market Inefficiency Quotient", shorttitle="TANIQ", overlay=false, precision=3, max_labels_count=50)
+
+// =====================================================================
+// SECTION 1: USER INPUTS
+// =====================================================================
+grp1 = "📊 Core Parameters"
+adrLen       = input.int(14, "ADR Lookback Period", minval=5, group=grp1, 
+     tooltip="Number of bars used to calculate the Average Daily Range %. Higher = smoother, slower reacting.")
+adtvLen      = input.int(20, "ADTV Lookback Period", minval=5, group=grp1, 
+     tooltip="Number of bars used to calculate Average Daily Trading Volume. Acts as the liquidity filter.")
+classVolLen  = input.int(20, "Benchmark Vol Lookback", minval=5, group=grp1, 
+     tooltip="Lookback for the benchmark/sector volatility baseline.")
+
+grp2 = "🎯 Benchmark & Costs"
+benchmark    = input.symbol("SPY", "Benchmark / Sector ETF Symbol", group=grp2, 
+     tooltip="The reference asset representing the 'class volatility'. Use SPY for broad market, QQQ for tech, XLE for energy, or a specific sector ETF.")
+costPct      = input.float(0.20, "Round-Trip Cost (%)", step=0.01, minval=0, group=grp2, 
+     tooltip="Total cost to enter AND exit the trade. Includes: commissions + half-spread (entry) + half-spread (exit) + estimated slippage. Example: 0.20 = 0.20%.")
+
+grp3 = "🚨 Thresholds & Alerts"
+edgeThresh   = input.float(0.40, "Edge Threshold", step=0.05, group=grp3, 
+     tooltip="TANIQ values above this indicate a potentially actionable inefficiency.")
+strongThresh = input.float(0.60, "Strong Edge Threshold", step=0.05, group=grp3, 
+     tooltip="TANIQ values above this indicate a high-confidence structural inefficiency.")
+
+grp4 = "🎨 Visuals"
+showComponents = input.bool(true, "Show Component Breakdown Table", group=grp4)
+showBg         = input.bool(true, "Show Background Zones", group=grp4)
+
+// =====================================================================
+// SECTION 2: TIMEFRAME MULTIPLIER (T)
+// =====================================================================
+// Converts the current chart timeframe into a "day-equivalent" multiplier.
+// Daily = 1, Weekly = 5, Monthly = 20, Intraday = fractional.
+getT() =>
+    float t = 1.0
+    if timeframe.isintraday
+        float minsInTradingDay = 390.0  // US equity market hours
+        if timeframe.period == "1"
+            t := 1.0 / minsInTradingDay
+        else if timeframe.period == "3"
+            t := 3.0 / minsInTradingDay
+        else if timeframe.period == "5"
+            t := 5.0 / minsInTradingDay
+        else if timeframe.period == "15"
+            t := 15.0 / minsInTradingDay
+        else if timeframe.period == "30"
+            t := 30.0 / minsInTradingDay
+        else if timeframe.period == "60" or timeframe.period == "1H"
+            t := 60.0 / minsInTradingDay
+        else if timeframe.period == "120" or timeframe.period == "2H"
+            t := 120.0 / minsInTradingDay
+        else if timeframe.period == "240" or timeframe.period == "4H"
+            t := 240.0 / minsInTradingDay
+        else
+            t := (timeframe.multiplier * 1.0) / minsInTradingDay
+    else if timeframe.isdaily
+        t := 1.0
+    else if timeframe.isweekly
+        t := 5.0
+    else if timeframe.ismonthly
+        t := 20.0
+    t
+
+T = getT()
+
+// =====================================================================
+// SECTION 3: COMPONENT CALCULATIONS
+// =====================================================================
+
+// 1. ADR% - The asset's own average daily range as a percentage
+dailyRangePct = (high - low) / close * 100
+adrPct        = ta.sma(dailyRangePct, adrLen)
+
+// 2. Benchmark/Class Volatility - Always pulled from DAILY timeframe
+// This ensures σ_class is comparable regardless of chart timeframe
+[benchH, benchL, benchC] = request.security(benchmark, "D", [high, low, close], lookahead=barmerge.lookahead_off)
+benchDailyRangePct       = (benchH - benchL) / benchC * 100
+classVol                 = ta.sma(benchDailyRangePct, classVolLen)
+
+// 3. ADTV - Average Daily Trading Volume
+adtv = ta.sma(volume, adtvLen)
+
+// =====================================================================
+// SECTION 4: THE TANIQ FORMULA
+// =====================================================================
+// TANIQ = (ADR% / σ_class) × (T^0.75 / ln(ADTV+1)) × max(0, 1 - C/(ADR%×√T))
+
+// Component A: Idiosyncratic Signal Ratio
+signalRatio = adrPct / math.max(classVol, 0.001)
+
+// Component B: Structural Friction Multiplier (Timeframe vs Liquidity)
+liquidityFactor = math.pow(math.max(T, 0.001), 0.75) / math.log(adtv + 1)
+
+// Component C: Net Edge Survival Rate (after costs)
+expectedMove    = adrPct * math.sqrt(math.max(T, 0.001))
+costSurvival    = math.max(0.0, 1.0 - (costPct / math.max(expectedMove, 0.001)))
+
+// Final TANIQ Score
+taniq = signalRatio * liquidityFactor * costSurvival
+
+// =====================================================================
+// SECTION 5: PLOTTING & VISUALS
+// =====================================================================
+
+// Color logic based on TANIQ level
+taniqColor = taniq >= strongThresh ? color.new(color.lime, 0) : 
+             taniq >= edgeThresh   ? color.new(color.yellow, 0) : 
+             taniq >= 0.20         ? color.new(color.orange, 20) : 
+                                     color.new(color.gray, 40)
+
+// Main TANIQ line with hover tooltip
+plot(taniq, "TANIQ Score", color=taniqColor, linewidth=2, 
+     tooltip="TANIQ: Timeframe-Adjusted Net Inefficiency Quotient\n\n" +
+             "• > 0.60 = STRONG EDGE (high inefficiency, low cost drag)\n" +
+             "• 0.40-0.60 = ACTIONABLE EDGE (worth investigating)\n" +
+             "• 0.20-0.40 = WEAK EDGE (marginal, needs confirmation)\n" +
+             "• < 0.20 = EFFICIENT (no structural edge)\n\n" +
+             "Use this as a FILTER, not a signal. Pair with a directional strategy.")
+
+// Threshold lines
+h1 = hline(strongThresh, "Strong Edge", color=color.new(color.lime, 50), linestyle=hline.style_dotted)
+h2 = hline(edgeThresh, "Edge Threshold", color=color.new(color.yellow, 50), linestyle=hline.style_dotted)
+hline(0.20, "Weak Edge", color=color.new(color.orange, 70), linestyle=hline.style_dotted)
+hline(0, "Zero Line", color=color.new(color.gray, 70))
+
+// Background fill for zones
+fill(h1, h2, color=showBg ? color.new(color.lime, 92) : na, title="Strong Edge Zone")
+fill(h2, hline(0.20), color=showBg ? color.new(color.yellow, 94) : na, title="Actionable Zone")
+
+// Mark crossovers of the edge threshold
+plotshape(ta.crossover(taniq, edgeThresh), "Edge Detected", shape.triangleup, location.bottom, color.lime, size=size.small,
+     tooltip="TANIQ crossed ABOVE the edge threshold. Inefficiency is increasing — potential setup forming.")
+plotshape(ta.crossunder(taniq, edgeThresh), "Edge Faded", shape.triangledown, location.top, color.red, size=size.small,
+     tooltip="TANIQ crossed BELOW the edge threshold. Inefficiency is fading — edge may be closing.")
+
+// =====================================================================
+// SECTION 6: ALERTS
+// =====================================================================
+alertcondition(ta.crossover(taniq, edgeThresh), 
+     title="🟢 Edge Detected", 
+     message="TANIQ ALERT: {{ticker}} on {{interval}} has crossed above the edge threshold ({{plot_0}}). Structural inefficiency detected. Investigate for directional setup.")
+
+alertcondition(ta.crossunder(taniq, edgeThresh), 
+     title="🔴 Edge Faded", 
+     message="TANIQ ALERT: {{ticker}} on {{interval}} has dropped below edge threshold ({{plot_0}}). Inefficiency is fading.")
+
+alertcondition(ta.crossover(taniq, strongThresh), 
+     title="🚀 Strong Edge", 
+     message="TANIQ ALERT: {{ticker}} on {{interval}} entered STRONG EDGE territory ({{plot_0}}). High-confidence inefficiency.")
+
+alertcondition(ta.crossunder(taniq, 0.20), 
+     title="⚪ Market Efficient", 
+     message="TANIQ ALERT: {{ticker}} on {{interval}} is now highly efficient ({{plot_0}}). Avoid directional trades.")
+
+// Dynamic alert with all components
+alertcondition(ta.crossover(taniq, edgeThresh), 
+     title="📋 Full Diagnostic", 
+     message="TANIQ FULL DIAGNOSTIC\n\nTicker: {{ticker}}\nTimeframe: {{interval}}\nTANIQ: {{plot_0}}\n\nInterpretation: Check if this asset has a directional catalyst before entering.")
+
+// =====================================================================
+// SECTION 7: INFO TABLE (Hover Help & Live Component Breakdown)
+// =====================================================================
+if showComponents and barstate.islast
+    var table infoTable = table.new(position.top_right, 2, 8, 
+         bgcolor=color.new(color.black, 80), 
+         border_width=1, 
+         border_color=color.new(color.gray, 50),
+         frame_width=1,
+         frame_color=color.new(color.gray, 50))
+
+    // Header
+    table.cell(infoTable, 0, 0, "TANIQ COMPONENTS", text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 60))
+    table.cell(infoTable, 1, 0, "VALUE", text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 60))
+
+    // TANIQ Score
+    table.cell(infoTable, 0, 1, "📊 TANIQ Score", text_color=color.white, text_size=size.small,
+         tooltip="The final inefficiency quotient. Higher = more exploitable edge.")
+    table.cell(infoTable, 1, 1, str.tostring(taniq, "#.###"), text_color=taniqColor, text_size=size.small)
+
+    // Signal Ratio
+    table.cell(infoTable, 0, 2, "📡 Signal Ratio", text_color=color.white, text_size=size.small,
+         tooltip="ADR% ÷ Benchmark Vol.\n\nMeasures how much the asset moves RELATIVE to its sector. > 1.0 means the asset is more volatile than its peers (idiosyncratic movement).")
+    table.cell(infoTable, 1, 2, str.tostring(signalRatio, "#.##") + "x", text_color=color.aqua, text_size=size.small)
+
+    // Liquidity Factor
+    table.cell(infoTable, 0, 3, "💧 Liquidity Factor", text_color=color.white, text_size=size.small,
+         tooltip="T^0.75 ÷ ln(ADTV+1)\n\nHigher timeframe + lower volume = higher score. This is where the structural edge lives. Illiquid assets on weekly charts score highest.")
+    table.cell(infoTable, 1, 3, str.tostring(liquidityFactor, "#.####"), text_color=color.purple, text_size=size.small)
+
+    // Cost Survival
+    table.cell(infoTable, 0, 4, "💰 Cost Survival", text_color=color.white, text_size=size.small,
+         tooltip="% of expected move that survives round-trip costs.\n\n1.0 = costs are negligible\n0.5 = half your edge goes to friction\n0.0 = costs eat the entire move (no trade)")
+    table.cell(infoTable, 1, 4, str.tostring(costSurvival * 100, "#.#") + "%", text_color=costSurvival > 0.8 ? color.lime : costSurvival > 0.5 ? color.yellow : color.red, text_size=size.small)
+
+    // Raw Inputs
+    table.cell(infoTable, 0, 5, "📏 ADR%", text_color=color.white, text_size=size.small, tooltip="Average Daily Range as % of price")
+    table.cell(infoTable, 1, 5, str.tostring(adrPct, "#.##") + "%", text_color=color.white, text_size=size.small)
+
+    table.cell(infoTable, 0, 6, "📈 Benchmark Vol", text_color=color.white, text_size=size.small, tooltip="Daily volatility of " + benchmark)
+    table.cell(infoTable, 1, 6, str.tostring(classVol, "#.##") + "%", text_color=color.white, text_size=size.small)
+
+    table.cell(infoTable, 0, 7, "📊 ADTV", text_color=color.white, text_size=size.small, tooltip="Average Daily Trading Volume")
+    table.cell(infoTable, 1, 7, str.tostring(adtv, "#.##"), text_color=color.white, text_size=size.small)
+
+// =====================================================================
+// SECTION 8: USAGE GUIDE (Displayed in indicator description)
+// =====================================================================
+// HOW TO USE TANIQ:
+//
+// 1. UNIVERSE SCREENING: Run TANIQ across multiple assets. Sort by highest score.
+//    The top decile contains the most structurally inefficient assets.
+//
+// 2. TIMEFRAME SELECTION: Switch between Daily (T=1) and Weekly (T=5) charts.
+//    If TANIQ jumps significantly on the weekly, the asset has a structural edge
+//    that intraday traders cannot capture.
+//
+// 3. POSITION SIZING: Size positions proportional to TANIQ score.
+//    A 0.70 score deserves a larger allocation than a 0.30 score.
+//
+// 4. REGIME DETECTION: If TANIQ drops below 0.20 across most of your universe,
+//    the market is hyper-efficient. Reduce directional exposure.
+//
+// WHEN NOT TO USE:
+// - Binary events (earnings, FDA approvals) - costs are underestimated
+// - Micro-caps where your order size > 5% of ADTV (market impact)
+// - As a standalone directional signal (it's a filter, not a trigger)
+// - During extreme volatility regimes (VIX > 35)

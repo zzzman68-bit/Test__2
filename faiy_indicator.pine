@@ -1,0 +1,147 @@
+//@version=6
+// FAIY - Friction-Adjusted Inefficiency Yield  (experimental heuristic, NOT validated, not investment advice)
+//
+//   C_total = C + kappa * sigma_d * sqrt(Q / ADTV$)
+//   M       = 0.8 * sigma_d * sqrt(T)
+//   H       = C_total / M            <- the "Capture Hurdle" (lower = cheaper to trade)
+//   N       = sigma_d / sigma_class
+//   FAIY    = N / H * exp(-T / tau)  (decay term optional)
+//
+// Letter grade (A-F) is based on H: it grades TRADABILITY at your size, not edge.
+// All inputs are computed from DAILY data (previous completed day) so values do not repaint.
+
+indicator("FAIY - Friction-Adjusted Inefficiency Yield", "FAIY", overlay = true, max_labels_count = 500)
+
+// ───────────────────────── Inputs ─────────────────────────
+G1 = "1. Core settings"
+lb       = input.int(20, "Lookback (days)", minval = 5, maxval = 250, group = G1,
+     tooltip = "Number of daily bars used for ADR% and ADTV. 20 = current behaviour, 50-60 = structural. Compare both: if 20-day ADR is far above 50-day, the volatility is probably event-driven and temporary.")
+T        = input.int(5, "Holding period T (days)", minval = 1, maxval = 250, group = G1,
+     tooltip = "How long you intend to hold. Longer T = bigger expected move M (grows with sqrt(T)) so costs matter less. Match this to the timeframe where your edge was found (e.g. 5 for daily-candle swing, 20 for weekly).")
+Q        = input.float(100000, "Position size Q (chart currency)", minval = 1, group = G1,
+     tooltip = "Your intended position in the SAME currency as the chart (MYR for Bursa, USD for US stocks). Bigger Q = more market impact. This is the single most important input to set honestly.")
+cQuoted  = input.float(0.10, "Quoted round-trip cost (%)", minval = 0, step = 0.01, group = G1,
+     tooltip = "Spread + commissions + fees + stamp duty for a full buy-and-sell, as % of price. Example: 0.10 = 0.10%. Use your real broker numbers; this is the floor of your cost.") / 100
+kappa    = input.float(1.0, "Impact coefficient kappa", minval = 0, step = 0.1, group = G1,
+     tooltip = "Scales square-root market impact. Roughly 0.5-1.0 for liquid stocks. Calibrate against your actual slippage: if fills are consistently worse than the table predicts, raise it.")
+tau      = input.float(0, "Edge decay tau (days, 0 = off)", minval = 0, group = G1,
+     tooltip = "Optional. Your signal's decay time constant. FAIY is multiplied by exp(-T/tau), which stops the score rising forever with T. 0 disables it. Measure tau from your backtest; don't guess.")
+benchSym = input.symbol("SPY", "Class / benchmark symbol", group = G1,
+     tooltip = "Index representing the asset class, used for sigma_class (the N term). SPY for US stocks, a local index (e.g. FBMKLCI) for Bursa, BTCUSD for crypto altcoins.")
+
+G2 = "2. Gates (eligibility)"
+hCap     = input.float(0.10, "Max hurdle H", minval = 0.01, step = 0.01, group = G2,
+     tooltip = "Break-even needs you to capture at most this fraction of the typical move. 0.10 = costs eat 10% of the expected move. Lower = stricter. Also used to compute Max position size.")
+minAdr   = input.float(3.0, "Min ADR (%)", minval = 0, step = 0.5, group = G2,
+     tooltip = "Rejects quiet stocks. FAIY rewards cheapness, so very quiet mega-caps can score high without having any move worth trading. This gate fixes that.") / 100
+minN     = input.float(1.5, "Min N (stock vol / class vol)", minval = 0, step = 0.1, group = G2,
+     tooltip = "Rejects stocks that just track the benchmark. N above 1.5 means the stock moves idiosyncratically. Assumption: that implies less arbitrage attention. Untested; treat as a filter, not proof of mispricing.")
+minAdtv  = input.float(5.0, "Min ADTV (millions, chart currency)", minval = 0, step = 1, group = G2,
+     tooltip = "Hard liquidity floor in millions. Rejects thin names regardless of H.") * 1e6
+
+G3 = "3. Letter grade thresholds (on H)"
+hA = input.float(0.05, "A if H <=", step = 0.01, group = G3, tooltip = "A = very cheap to trade at your size.")
+hB = input.float(0.10, "B if H <=", step = 0.01, group = G3, tooltip = "B = fine for most swing strategies.")
+hC = input.float(0.20, "C if H <=", step = 0.01, group = G3, tooltip = "C = marginal. Your signal needs a strong edge to pay for costs.")
+hD = input.float(0.35, "D if H <=", step = 0.01, group = G3, tooltip = "D = expensive. Reduce size or lengthen holding period. Above this = F (do not trade at this size).")
+
+G4 = "4. Display"
+showTable  = input.bool(true, "Show table", group = G4, tooltip = "Hover over any row in the table for an explanation of how to read it.")
+tablePos   = input.string(position.top_right, "Table position", options = [position.top_left, position.top_right, position.bottom_left, position.bottom_right, position.middle_right], group = G4)
+showLabels = input.bool(true, "Show letter labels when grade changes", group = G4, tooltip = "Draws the grade letter on the chart when it changes. Hover over a letter for the full explanation.")
+
+// ───────────────────────── Data (daily, non-repainting) ─────────────────────────
+[adr, adtv] = request.security(syminfo.tickerid, "D",
+     [ta.sma(high / low - 1, lb)[1], ta.sma(close * volume, lb)[1]],
+     lookahead = barmerge.lookahead_on)
+
+sigClass = request.security(benchSym, "D",
+     ta.stdev(ta.roc(close, 1) / 100, lb)[1],
+     lookahead = barmerge.lookahead_on)
+
+// ───────────────────────── FAIY maths ─────────────────────────
+sigD   = adr / 1.67
+valid  = not na(adr) and not na(adtv) and not na(sigClass) and adtv > 0 and sigD > 0 and sigClass > 0
+
+impact = kappa * sigD * math.sqrt(Q / adtv)
+cTot   = cQuoted + impact
+M      = 0.8 * sigD * math.sqrt(T)
+H      = cTot / M
+N      = sigD / sigClass
+decay  = tau > 0 ? math.exp(-T / tau) : 1.0
+faiy   = N / H * decay
+dtl    = Q / adtv                                   // days-to-liquidate at 100% participation
+maxQ   = adtv * math.pow(math.max(hCap * M - cQuoted, 0) / (kappa * sigD), 2)
+
+gAdr  = valid and adr >= minAdr
+gN    = valid and N >= minN
+gLiq  = valid and adtv >= minAdtv
+gH    = valid and H <= hCap
+eligible = gAdr and gN and gLiq and gH
+
+// ───────────────────────── Letter grade ─────────────────────────
+f_grade(h) => h <= hA ? 5 : h <= hB ? 4 : h <= hC ? 3 : h <= hD ? 2 : 1
+f_letter(g) => g == 5 ? "A" : g == 4 ? "B" : g == 3 ? "C" : g == 2 ? "D" : "F"
+f_color(g) => g == 5 ? color.new(color.green, 0) : g == 4 ? color.new(color.lime, 0) : g == 3 ? color.new(color.yellow, 0) : g == 2 ? color.new(color.orange, 0) : color.new(color.red, 0)
+f_usd(x) => na(x) ? "n/a" : x >= 1e9 ? str.tostring(x / 1e9, "#.##") + "B" : x >= 1e6 ? str.tostring(x / 1e6, "#.##") + "M" : str.tostring(x / 1e3, "#.##") + "K"
+f_pct(x) => na(x) ? "n/a" : str.tostring(x * 100, "#.##") + "%"
+
+int gradeNum = valid ? f_grade(H) : na
+string letter = na(gradeNum) ? "?" : f_letter(gradeNum)
+color  gcol   = na(gradeNum) ? color.gray : f_color(gradeNum)
+
+// Flag letters: which gate failed
+string flags = (valid and not gAdr ? "V " : "") + (valid and not gN ? "N " : "") + (valid and not gLiq ? "L " : "") + (valid and not gH ? "H " : "")
+string flagTxt = flags == "" ? (valid ? "none" : "no data") : str.trim(flags)
+
+// ───────────────────────── Chart labels (hover for help) ─────────────────────────
+labelTip = "GRADE " + letter + "  (FAIY " + (valid ? str.tostring(faiy, "#.#") : "n/a") + ")" +
+     "\nHurdle H = " + (valid ? str.tostring(H, "#.###") : "n/a") + " -> you must capture " + (valid ? f_pct(H) : "n/a") + " of the typical " + str.tostring(T) + "-day move just to break even." +
+     "\nTotal cost = " + f_pct(cTot) + " vs expected move " + f_pct(M) +
+     "\nMax size at your hurdle cap: " + f_usd(maxQ) +
+     "\nFailed gates: " + flagTxt +
+     "\n\nHOW TO USE: A/B = tradable at your size. C = need strong edge. D/F = shrink size, hold longer, or skip. This grades COST, not direction or edge."
+
+if showLabels and not na(gradeNum) and gradeNum != nz(gradeNum[1], -1)
+    label.new(bar_index, high, letter, style = label.style_label_down, color = gcol,
+         textcolor = color.black, size = size.normal, tooltip = labelTip)
+
+// ───────────────────────── Table (hover rows for help) ─────────────────────────
+var table tbl = table.new(tablePos, 2, 12, border_width = 1,
+     frame_color = color.new(color.gray, 60), border_color = color.new(color.gray, 70))
+
+f_row(r, name, val, tip, col) =>
+    table.cell(tbl, 0, r, name, text_color = color.white, bgcolor = color.new(color.gray, 70), text_halign = text.align_left, tooltip = tip)
+    table.cell(tbl, 1, r, val, text_color = color.black, bgcolor = col, text_halign = text.align_right, tooltip = tip)
+
+if showTable and barstate.islast
+    okCol   = color.new(color.green, 40)
+    badCol  = color.new(color.red, 40)
+    neutral = color.new(color.silver, 20)
+    f_row(0, "Grade", letter, "Letter grade from H. A/B = cheap to trade at your size, C = marginal, D/F = too expensive. It grades tradability, NOT edge or direction.", gcol)
+    f_row(1, "FAIY", valid ? str.tostring(faiy, "#.#") : "n/a", "N divided by H (times decay if enabled). Higher = cheaper to trade AND more idiosyncratic. Use to compare names, but be aware it rewards cheapness; quiet mega-caps can score high. Always apply the gates.", neutral)
+    f_row(2, "Hurdle H", valid ? str.tostring(H, "#.###") : "n/a", "Fraction of the typical move you must capture just to cover costs. 0.05 = great, 0.10 = fine, 0.35+ = unrealistic. Your expected alpha over T days should be 2-3x the total cost.", gH ? okCol : badCol)
+    f_row(3, "Total cost", f_pct(cTot), "Quoted cost + square-root market impact for your size Q. Compare to your signal's expected return over T days: if alpha < cost, skip.", neutral)
+    f_row(4, "Expected move M", f_pct(M), "Typical absolute move over T days (0.8 x sigma x sqrt(T)). This is the size of the prize, NOT your edge.", neutral)
+    f_row(5, "N (vs class)", valid ? str.tostring(N, "#.##") : "n/a", "Stock volatility divided by benchmark volatility. Above ~1.5 = moves on its own. Assumed to mean less arbitrage attention. Unvalidated: could also be noise or a risk premium.", gN ? okCol : badCol)
+    f_row(6, "ADR%", f_pct(adr), "Average daily range over the lookback. Under 2% = sluggish, 3-5% = tradable, 5%+ = size down. Check 20-day vs 50-day for stability.", gAdr ? okCol : badCol)
+    f_row(7, "ADTV", f_usd(adtv), "Average daily dollar volume (price x shares). The liquidity dial: low ADTV means higher impact and limited capacity.", gLiq ? okCol : badCol)
+    f_row(8, "Days to liquidate", valid ? str.tostring(dtl, "#.###") : "n/a", "Position size divided by ADTV. Above ~0.05 (5% of daily volume) impact starts to bite. Above 1.0 you cannot exit in a day at full participation.", dtl <= 0.05 ? okCol : (dtl <= 0.25 ? neutral : badCol))
+    f_row(9, "Max position", f_usd(maxQ), "Largest position that keeps H at or below your hurdle cap. If your Q is above this, shrink size or lengthen the holding period T.", Q <= maxQ ? okCol : badCol)
+    f_row(10, "Flags", flagTxt, "Letters show failed gates. V = ADR below minimum (too quiet). N = too index-like. L = ADTV below floor. H = hurdle above your cap (position too big or costs too high).", flags == "" and valid ? okCol : badCol)
+    f_row(11, "ELIGIBLE", eligible ? "YES" : "NO", "YES only when all four gates pass (ADR, N, ADTV, hurdle). It means 'worth researching or trading at this size', not 'will make money'. You still need a real edge.", eligible ? okCol : badCol)
+
+// ───────────────────────── Alerts ─────────────────────────
+// Create via: Alerts panel -> Condition = FAIY -> choose one below.
+alertcondition(valid and gradeNum >= 4 and nz(gradeNum[1], 0) < 4, "FAIY: grade improved to A or B",
+     "{{ticker}}: tradability grade is now A/B (cheap to trade at your size).")
+alertcondition(valid and gradeNum <= 2 and nz(gradeNum[1], 5) > 2, "FAIY: grade fell to D or F",
+     "{{ticker}}: tradability grade fell to D/F (costs too high at your size).")
+alertcondition(eligible and not nz(eligible[1], false), "FAIY: became ELIGIBLE (all gates pass)",
+     "{{ticker}}: all FAIY gates now pass (ADR, N, ADTV, hurdle).")
+alertcondition(valid and not eligible and nz(eligible[1], false), "FAIY: lost eligibility",
+     "{{ticker}}: a FAIY gate now fails. Check which flag letter (V/N/L/H) in the table.")
+alertcondition(valid and not gH and nz(gH[1], false), "FAIY: hurdle breached (size too big)",
+     "{{ticker}}: hurdle H exceeds your cap. Position is too large for current liquidity/volatility.")
+alertcondition(valid and not gLiq and nz(gLiq[1], false), "FAIY: liquidity dropped below floor",
+     "{{ticker}}: ADTV fell below your minimum.")
