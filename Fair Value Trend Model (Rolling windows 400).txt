@@ -1,0 +1,121 @@
+//@version=6
+indicator("Fair Value Trend Model (Rebuild)", shorttitle="FVTM Rolling windows: 400", overlay=true, max_lines_count=20)
+
+// ───────────── Inputs ─────────────
+var string G1 = "Fair Value"
+var string G2 = "Channel Bands"
+var string G3 = "Forecast"
+var string G4 = "Regression Window"
+
+bullColor = input.color(color.new(#00c853, 0), "Bullish FV Colour (price ≥ FV)", group = G1)
+bearColor = input.color(color.new(#ff1744, 0), "Bearish FV Colour (price < FV)", group = G1)
+fvWidth   = input.int(2, "Fair-Value Line Width", minval = 1, maxval = 6, group = G1)
+
+showBands = input.bool(true, "Show FV Channel Bands", group = G2)
+upperPct  = input.float(50.0, "Channel Band Upper %", minval = 0.0, step = 1.0, group = G2)
+lowerPct  = input.float(50.0, "Channel Band Lower %", minval = 0.0, maxval = 99.9, step = 1.0, group = G2)
+bandColor = input.color(color.new(color.gray, 20), "Band Colour", group = G2)
+fillColor = input.color(color.new(color.gray, 90), "Band Fill Colour", group = G2)
+
+showForecast = input.bool(true, "Show Forecast Line", group = G3)
+forecastBars = input.int(30, "Forecast Bars (M)", minval = 1, maxval = 500, group = G3)
+fcColor      = input.color(color.yellow, "Forecast Line Colour", group = G3)
+
+useRolling = input.bool(true, "Use Rolling Window?", group = G4)
+winBars    = input.int(250, "Window Bars", minval = 3, group = G4)
+
+// ───────────── Data transformation ─────────────
+// t0 = timestamp (ms) of the first bar on the chart
+var int t0 = time
+
+float d = math.max(1.0, (time - t0) / 86400000.0)   // days since first bar, min 1
+float x = math.log(d)                                // ln(days)
+float y = math.log(close)                            // ln(price)
+
+// ───────────── Regression sums ─────────────
+// Cumulative sums (called on every bar, never inside a conditional)
+float cx  = ta.cum(x)
+float cy  = ta.cum(y)
+float cxy = ta.cum(x * y)
+float cx2 = ta.cum(x * x)
+
+// All-time: full cumulative sums.
+// Rolling: cumulative sums minus the sums from W bars ago (exact sliding window).
+float sx  = useRolling ? cx  - nz(cx[winBars])  : cx
+float sy  = useRolling ? cy  - nz(cy[winBars])  : cy
+float sxy = useRolling ? cxy - nz(cxy[winBars]) : cxy
+float sx2 = useRolling ? cx2 - nz(cx2[winBars]) : cx2
+
+float n = useRolling ? math.min(bar_index + 1, winBars) : bar_index + 1
+
+// ───────────── OLS: slope (b) and intercept (a) ─────────────
+float den = n * sx2 - sx * sx
+float b = math.abs(den) < 1e-12 ? 0.0 : (n * sxy - sx * sy) / den
+float a = (sy - b * sx) / n
+
+// ───────────── Fair value & channel bands ─────────────
+float fv    = math.exp(a + b * x)          // F(t) = exp(a) * d^b
+float upper = fv * (1.0 + upperPct / 100.0) // U(t)
+float lower = fv * (1.0 - lowerPct / 100.0) // L(t)
+
+// ───────────── Plots ─────────────
+color fvColor = close >= fv ? bullColor : bearColor
+plot(fv, "Fair Value", color = fvColor, linewidth = fvWidth)
+
+pUpper = plot(showBands ? upper : na, "FV Upper Band", color = bandColor, linewidth = 1)
+pLower = plot(showBands ? lower : na, "FV Lower Band", color = bandColor, linewidth = 1)
+fill(pUpper, pLower, color = fillColor, title = "FV Channel Fill")
+
+// ───────────── Forecast (constant per-bar increment) ─────────────
+var line fcFv = na
+var line fcUp = na
+var line fcLo = na
+
+if barstate.islast
+    if showForecast and bar_index > 0
+        float dF = fv - fv[1]
+        float dU = upper - upper[1]
+        float dL = lower - lower[1]
+
+        int xEnd = bar_index + forecastBars
+        float fvF = fv + forecastBars * dF
+        float upF = upper + forecastBars * dU
+        float loF = lower + forecastBars * dL
+
+        // Fair-value projection
+        if na(fcFv)
+            fcFv := line.new(bar_index, fv, xEnd, fvF, xloc = xloc.bar_index, color = fcColor, style = line.style_dashed, width = 2)
+        else
+            line.set_xy1(fcFv, bar_index, fv)
+            line.set_xy2(fcFv, xEnd, fvF)
+            line.set_color(fcFv, fcColor)
+
+        // Band projections
+        if showBands
+            if na(fcUp)
+                fcUp := line.new(bar_index, upper, xEnd, upF, xloc = xloc.bar_index, color = color.new(bandColor, 40), style = line.style_dashed)
+            else
+                line.set_xy1(fcUp, bar_index, upper)
+                line.set_xy2(fcUp, xEnd, upF)
+            if na(fcLo)
+                fcLo := line.new(bar_index, lower, xEnd, loF, xloc = xloc.bar_index, color = color.new(bandColor, 40), style = line.style_dashed)
+            else
+                line.set_xy1(fcLo, bar_index, lower)
+                line.set_xy2(fcLo, xEnd, loF)
+        else
+            if not na(fcUp)
+                line.delete(fcUp)
+                fcUp := na
+            if not na(fcLo)
+                line.delete(fcLo)
+                fcLo := na
+    else
+        if not na(fcFv)
+            line.delete(fcFv)
+            fcFv := na
+        if not na(fcUp)
+            line.delete(fcUp)
+            fcUp := na
+        if not na(fcLo)
+            line.delete(fcLo)
+            fcLo := na
