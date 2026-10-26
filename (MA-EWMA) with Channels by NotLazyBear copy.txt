@@ -1,0 +1,79 @@
+//@version=5
+indicator("Hamming Windowed Volume-Weighted Bidirectional Momentum-Adaptive Exponential Weighted Moving Average (MA-EWMA) with Channels", overlay=true)
+import TradingView/ta/8
+
+// ——— Input Parameters ———
+baseLookback = input.int(88, title="Base Lookback Period")  // Base lookback period for volatility and smoothing
+baseMomentumLength = input.int(18, title="Base Momentum Length")  // Base momentum length
+baseVolatilitySensitivity = input.float(0.5, title="Base Volatility Sensitivity")  // Base volatility sensitivity
+windowLength = input.int(33, title="Hamming Window Length")  // Length of the Hamming window
+channelMultiplier = input.float(6.618, title="Channel Width Multiplier")  // Multiplier for the channel width
+
+// ——— Dynamic Adjustments Based on Market Conditions ———
+
+// Adjust lookback period based on ATR (higher ATR -> shorter lookback for faster response)
+dynamicLookback = baseLookback - math.min(10, ta.atr(baseLookback) * 10)
+dynamicLookback := math.max(dynamicLookback, 5)  // Ensure minimum lookback of 5
+
+// Adjust momentum length based on recent price volatility (high volatility -> shorter momentum length)
+dynamicMomentumLength = baseMomentumLength - math.min(5, ta.atr(baseMomentumLength) * 5)
+dynamicMomentumLength := math.max(dynamicMomentumLength, 3)  // Ensure minimum momentum length of 3
+
+// Adjust volatility sensitivity dynamically (more volatile -> higher sensitivity)
+dynamicVolatilitySensitivity = baseVolatilitySensitivity + (ta.atr(baseLookback) / 100)
+
+// Calculate upward and downward momentum separately with dynamic length
+upMomentum = math.max((close - close[dynamicMomentumLength]), 0)
+downMomentum = math.max((close[dynamicMomentumLength] - close), 0)
+
+// Volatility Calculation (using ATR) based on the dynamic lookback period
+volatility = ta.atr2(dynamicLookback)
+
+// Volume as a weight factor, normalized based on the dynamic lookback period
+volFactor = volume / ta.ema2(volume, dynamicLookback)
+
+// ——— Hamming Window Calculation ———
+hammingWindow = array.new_float(windowLength)
+for i = 0 to windowLength - 1
+    weight = 0.54 - 0.46 * math.cos(2 * math.pi * i / (windowLength - 1))  // Hamming window coefficient
+    array.set(hammingWindow, i, weight)
+
+// Function to apply the Hamming window
+applyHammingWindow(src, length) =>
+    weightedSum = 0.0
+    sumOfWeights = 0.0
+    for i = 0 to length - 1
+        weight = array.get(hammingWindow, i)
+        weightedSum := weightedSum + weight * nz(src[i])
+        sumOfWeights := sumOfWeights + weight
+    weightedSum / sumOfWeights
+
+// Apply Hamming window to the price data (close) before feeding into the adaptive EWMA
+hammingClose = applyHammingWindow(close, windowLength)
+
+// ——— Adaptive Weighting Formula for Upward and Downward Moves ———
+alphaUp = (upMomentum * volatility * volFactor) / (1 + math.abs(upMomentum) * math.abs(volatility) * volFactor)
+alphaDown = (downMomentum * volatility * volFactor) / (1 + math.abs(downMomentum) * math.abs(volatility) * volFactor)
+
+// ——— Dynamic Volume-Weighted Exponential Weighted Moving Average (MA-EWMA) with Hamming Window ———
+var float ma_ewma = na
+ma_ewma := na(ma_ewma[1]) ? hammingClose : (hammingClose > hammingClose[1] ? alphaUp * hammingClose + (1 - alphaUp) * ma_ewma[1] : alphaDown * hammingClose + (1 - alphaDown) * ma_ewma[1])
+
+// Calculate the upper and lower bands as dynamic channels
+upperChannel = ma_ewma + (volatility * channelMultiplier)
+lowerChannel = ma_ewma - (volatility * channelMultiplier)
+
+// ——— Plot Dynamic Channels (Upper and Lower) ———
+plot(upperChannel, color=color.green, linewidth=2, title="Upper Channel")
+plot(lowerChannel, color=color.red, linewidth=2, title="Lower Channel")
+
+// Fill between the upper and lower channels to create a visual band
+fill(plot(upperChannel), plot(lowerChannel), color=color.new(color.blue, 90), title="Channel Fill")
+
+// Plot original price for reference
+plot(close, color=color.gray, linewidth=1, title="Close")
+
+// Plot the dynamic adjustments for visual reference
+plot(dynamicLookback, color=color.red, linewidth=1, title="Dynamic Lookback (n)", display=display.none)
+plot(dynamicMomentumLength, color=color.green, linewidth=1, title="Dynamic Momentum Length (m)", display=display.none)
+plot(dynamicVolatilitySensitivity, color=color.orange, linewidth=1, title="Dynamic Volatility Sensitivity (v)", display=display.none)
