@@ -1,0 +1,35 @@
+//@version=4
+study(title="Golden Ratio Fibonacci Multipliers Top Detector [UO]", shorttitle="S", overlay=true)
+
+// Based on article "The Golden Ratio Multiplier" by Philip Swift (@PositiveCrypto) on Medium
+// https://medium.com/@positivecrypto/the-golden-ratio-multiplier-c2567401e12a 
+sma350 = sma(close, 350)
+sma111 = sma(close, 111)
+
+
+plot(bar_index % 6 != 0? sma111 : na, "SMA (close, 111)", color=color.gray, transp=0, linewidth=2, style=plot.style_linebr)
+plot(sma350, "SMA (close, 350)", color=#ffb200, transp=0, linewidth=4)
+plot(sma350 * 1.618, "SMA x 1.618 (Golden Ratio)", color=#83ff00, transp=0, linewidth=3)
+plot(bar_index % 6 != 0 ? (sma350 * 2) : na, "SMA x 2", color=#ff2a00, transp=0, linewidth=2, style=plot.style_linebr)
+plot(sma350  * 3, "SMA x 3", color=#ff00f6,  transp=0, linewidth=1)
+plot(sma350  * 5, "SMA x 5", color=#00f2ff, transp=0, linewidth=1)
+plot(sma350  * 8, "SMA x 8", color=color.yellow, transp=0, linewidth=1)
+plot(sma350  * 13, "SMA x 13", color=color.gray, transp=0, linewidth=1, style=plot.style_circles)
+plot(sma350  * 21, "SMA x 21", color=color.gray,  transp=0, linewidth=1, style=plot.style_circles)
+
+
+x2 = sma350 * 2
+top_detected = crossunder(x2, sma111)
+plotshape(top_detected, style=shape.xcross, color=#10ff00, size=size.normal, transp=0, text="TOP DETECTED")
+alertcondition(top_detected, title='Top Detected', message='Cycle Top Detected')
+
+plot(sma350 * 0.702 , "SMA * 0.702", color=#83ff00, transp=0, linewidth=3)
+
+sma13 = sma(close, 13)
+ema21 = ema(close, 21)
+sma50 = sma(close, 50)
+sma200 = sma(close, 200)
+plot( sma13, "SMA 13", color=color.green,  transp=30, style=plot.style_linebr )
+plot( ema21, "EMA 21", color=color.aqua, linewidth=2 )
+plot( sma50, "SMA 50", color=color.red, linewidth=3 )
+plot( sma200, "SMA200", color=color.green, linewidth=3)
